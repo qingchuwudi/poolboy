@@ -38,13 +38,15 @@
 
 -record(state, {
     supervisor :: undefined | pid(),
+    watcher :: undefined | pid(),
     workers = [] :: [pid()],
     waiting :: pid_queue(),
     monitors :: ets:tid(),
     size = 5 :: non_neg_integer(),
     overflow = 0 :: non_neg_integer(),
     max_overflow = 10 :: non_neg_integer(),
-    strategy = lifo :: lifo | fifo
+    strategy = lifo :: lifo | fifo,
+    timeout = 5000 :: non_neg_integer()
 }).
 
 -spec checkout(Pool :: pool()) -> pid().
@@ -162,15 +164,18 @@ init([{strategy, lifo} | Rest], WorkerArgs, State) ->
     init(Rest, WorkerArgs, State#state{strategy = lifo});
 init([{strategy, fifo} | Rest], WorkerArgs, State) ->
     init(Rest, WorkerArgs, State#state{strategy = fifo});
+init([{timeout, Timeout} | Rest], WorkerArgs, State) when is_integer(Timeout) ->
+    init(Rest, WorkerArgs, State#state{timeout = Timeout});
 init([_ | Rest], WorkerArgs, State) ->
     init(Rest, WorkerArgs, State);
-init([], _WorkerArgs, #state{size = Size, supervisor = Sup} = State) ->
+init([], _WorkerArgs, #state{size = Size, supervisor = Sup, timeout = Timeout} = State) ->
     Workers = prepopulate(Size, Sup),
-    {ok, State#state{workers = Workers}}.
+    Watcher = start_watcher(self(), Timeout),
+    {ok, State#state{workers = Workers, watcher = Watcher}}.
 
 handle_cast({checkin, Pid}, State = #state{monitors = Monitors}) ->
     case ets:lookup(Monitors, Pid) of
-        [{Pid, _, MRef}] ->
+        [{Pid, _, MRef, _From}] ->
             true = erlang:demonitor(MRef),
             true = ets:delete(Monitors, Pid),
             NewState = handle_checkin(Pid, State),
@@ -180,7 +185,7 @@ handle_cast({checkin, Pid}, State = #state{monitors = Monitors}) ->
     end;
 
 handle_cast({cancel_waiting, CRef}, State) ->
-    case ets:match(State#state.monitors, {'$1', CRef, '$2'}) of
+    case ets:match(State#state.monitors, {'$1', CRef, '$2', '_'}) of
         [[Pid, MRef]] ->
             demonitor(MRef, [flush]),
             true = ets:delete(State#state.monitors, Pid),
@@ -209,11 +214,11 @@ handle_call({checkout, CRef, Block}, {FromPid, _} = From, State) ->
     case Workers of
         [Pid | Left] ->
             MRef = erlang:monitor(process, FromPid),
-            true = ets:insert(Monitors, {Pid, CRef, MRef}),
+            true = ets:insert(Monitors, {Pid, CRef, MRef, From}),
             {reply, Pid, State#state{workers = Left}};
         [] when MaxOverflow > 0, Overflow < MaxOverflow ->
             {Pid, MRef} = new_worker(Sup, FromPid),
-            true = ets:insert(Monitors, {Pid, CRef, MRef}),
+            true = ets:insert(Monitors, {Pid, CRef, MRef, From}),
             {reply, Pid, State#state{overflow = Overflow + 1}};
         [] when Block =:= false ->
             {reply, full, State};
@@ -238,7 +243,7 @@ handle_call(get_all_workers, _From, State) ->
     {reply, WorkerList, State};
 handle_call(get_all_monitors, _From, State) ->
     Monitors = ets:select(State#state.monitors,
-                          [{{'$1', '_', '$2'}, [], [{{'$1', '$2'}}]}]),
+                          [{{'$1', '_', '$2', '_'}, [], [{{'$1', '$2'}}]}]),
     {reply, Monitors, State};
 handle_call(stop, _From, State) ->
     {stop, normal, ok, State};
@@ -247,7 +252,7 @@ handle_call(_Msg, _From, State) ->
     {reply, Reply, State}.
 
 handle_info({'DOWN', MRef, _, _, _}, State) ->
-    case ets:match(State#state.monitors, {'$1', '_', MRef}) of
+    case ets:match(State#state.monitors, {'$1', '_', MRef, '_'}) of
         [[Pid]] ->
             true = ets:delete(State#state.monitors, Pid),
             NewState = handle_checkin(Pid, State),
@@ -260,7 +265,7 @@ handle_info({'EXIT', Pid, _Reason}, State) ->
     #state{supervisor = Sup,
            monitors = Monitors} = State,
     case ets:lookup(Monitors, Pid) of
-        [{Pid, _, MRef}] ->
+        [{Pid, _, MRef, _From}] ->
             true = erlang:demonitor(MRef),
             true = ets:delete(Monitors, Pid),
             NewState = handle_worker_exit(Pid, State),
@@ -275,10 +280,14 @@ handle_info({'EXIT', Pid, _Reason}, State) ->
             end
     end;
 
+handle_info(timeout, State) ->
+    {noreply, handle_dump_client(State)};
+
 handle_info(_Info, State) ->
     {noreply, State}.
 
 terminate(_Reason, State) ->
+    catch State#state.watcher ! stop,
     ok = lists:foreach(fun (W) -> unlink(W) end, State#state.workers),
     true = exit(State#state.supervisor, shutdown),
     ok.
@@ -326,7 +335,7 @@ handle_checkin(Pid, State) ->
            strategy = Strategy} = State,
     case queue:out(Waiting) of
         {{value, {From, CRef, MRef}}, Left} ->
-            true = ets:insert(Monitors, {Pid, CRef, MRef}),
+            true = ets:insert(Monitors, {Pid, CRef, MRef, From}),
             gen_server:reply(From, Pid),
             State#state{waiting = Left};
         {empty, Empty} when Overflow > 0 ->
@@ -347,7 +356,7 @@ handle_worker_exit(Pid, State) ->
     case queue:out(State#state.waiting) of
         {{value, {From, CRef, MRef}}, LeftWaiting} ->
             NewWorker = new_worker(State#state.supervisor),
-            true = ets:insert(Monitors, {NewWorker, CRef, MRef}),
+            true = ets:insert(Monitors, {NewWorker, CRef, MRef, From}),
             gen_server:reply(From, NewWorker),
             State#state{waiting = LeftWaiting};
         {empty, Empty} when Overflow > 0 ->
@@ -357,6 +366,30 @@ handle_worker_exit(Pid, State) ->
                 [new_worker(Sup)
                  | lists:filter(fun (P) -> P =/= Pid end, State#state.workers)],
             State#state{workers = Workers, waiting = Empty}
+    end.
+
+handle_dump_client(State) ->
+    NewWaiting = lists:foldl(fun check_waiting_client/2,
+                             [],
+                             queue:to_list(State#state.waiting)),
+    lists:foldl(fun handle_dump_client2/2,
+                State#state{waiting = queue:from_list(NewWaiting)},
+                ets:tab2list(State#state.monitors)).
+
+handle_dump_client2({Pid, _, _, {FromPid, _}}, State) ->
+    case erlang:is_process_alive(FromPid) of
+        true ->
+            State;
+        false ->
+            exit(Pid, kill)
+    end.
+
+check_waiting_client({{FromPid, _}, _, _} = Wait, Waiting) ->
+    case erlang:is_process_alive(FromPid) of
+        true ->
+            [Wait | Waiting];
+        false ->
+            Waiting
     end.
 
 state_name(State = #state{overflow = Overflow}) when Overflow < 1 ->
@@ -370,3 +403,16 @@ state_name(#state{overflow = MaxOverflow, max_overflow = MaxOverflow}) ->
     full;
 state_name(_State) ->
     overflow.
+
+start_watcher(Pid, Timeout) ->
+    erlang:spawn_link(fun() -> watcher_loop(Pid, Timeout) end).
+
+watcher_loop(Pid, Timeout) ->
+    receive
+        stop -> stop;
+        _Any ->
+            start_watcher(Pid, Timeout)
+    after Timeout ->
+        Pid ! timeout,
+        start_watcher(Pid, Timeout)
+    end.
