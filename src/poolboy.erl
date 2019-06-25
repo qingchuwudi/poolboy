@@ -46,7 +46,7 @@
     overflow = 0 :: non_neg_integer(),
     max_overflow = 10 :: non_neg_integer(),
     strategy = lifo :: lifo | fifo,
-    timeout = 5000 :: non_neg_integer()
+    timeout = infinity :: timeout()
 }).
 
 -spec checkout(Pool :: pool()) -> pid().
@@ -202,6 +202,9 @@ handle_cast({cancel_waiting, CRef}, State) ->
             {noreply, State#state{waiting = Waiting}}
     end;
 
+handle_cast(check_worker, State) ->
+    {noreply, handle_dump_client(State)};
+
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
@@ -279,9 +282,6 @@ handle_info({'EXIT', Pid, _Reason}, State) ->
                     {noreply, State}
             end
     end;
-
-handle_info(timeout, State) ->
-    {noreply, handle_dump_client(State)};
 
 handle_info(_Info, State) ->
     {noreply, State}.
@@ -404,6 +404,8 @@ state_name(#state{overflow = MaxOverflow, max_overflow = MaxOverflow}) ->
 state_name(_State) ->
     overflow.
 
+start_watcher(_, infinity) ->
+    undefined;
 start_watcher(Pid, Timeout) ->
     erlang:spawn_link(fun() -> watcher_loop(Pid, Timeout) end).
 
@@ -413,6 +415,6 @@ watcher_loop(Pid, Timeout) ->
         _Any ->
             start_watcher(Pid, Timeout)
     after Timeout ->
-        Pid ! timeout,
+        gen_server:cast(Pid, check_worker),
         start_watcher(Pid, Timeout)
     end.
